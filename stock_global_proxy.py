@@ -1,12 +1,11 @@
 import streamlit as st
 import akshare as ak
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import time
 
-# --- 1. 页面配置 (完全保留) ---
+# --- 1. 页面配置 (完全保留您的原始样式) ---
 st.set_page_config(page_title="A股全向决策中心", layout="wide")
 
 st.markdown("""
@@ -18,48 +17,56 @@ st.markdown("""
     .tag-blue { background: #1e3a8a; color: #60a5fa; }
     .tag-green { background: #064e3b; color: #34d399; }
     .tag-gold { background: #451a03; color: #fbbf24; }
-    .tag-purple { background: #4c1d95; color: #c084fc; } 
+    .tag-purple { background: #4c1d95; color: #c084fc; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 优化后的核心函数 ---
+# --- 2. 核心算法函数 (云端稳定性增强) ---
+
 def get_safe_hist(code, start_d, end_d):
+    """
+    云端数据抓取核心：增加延迟防封，增加列名强制映射
+    """
     try:
-        # 云端防封核心：必须有延时
-        time.sleep(0.2) 
+        # 云端必须延迟，否则IP会被东方财富拦截
+        time.sleep(0.3) 
         df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_d, end_date=end_d, adjust="qfq")
         if df is None or df.empty: return None
         
-        # 字段自适应：不管它是中文还是英文，统一转为程序认识的名字
-        col_map = {
-            '收盘': 'close', '开盘': 'open', '最高': 'high', '最低': 'low', 
-            '成交量': 'volume', 'Close': 'close', 'Open': 'open'
-        }
+        # 强制标准化列名，防止云端环境出现中文乱码或字段名变动
+        df.columns = df.columns.str.replace(' ', '')
+        col_map = {'收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume'}
         df.rename(columns=col_map, inplace=True)
-        return df
+        
+        # 确保收盘价为浮点数
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        return df.dropna(subset=['close'])
     except:
         return None
 
-# 手写 RSI 避免依赖库在云端安装失败
-def fast_rsi(prices, n=14):
+def calculate_rsi(prices, period=14):
+    """
+    手动实现 RSI 算法，彻底摆脱 pandas_ta 导致的云端环境崩溃
+    """
+    if len(prices) < period: return np.zeros(len(prices))
     deltas = np.diff(prices)
-    seed = deltas[:n+1]
-    up = seed[seed >= 0].sum() / n
-    down = -seed[seed < 0].sum() / n
+    seed = deltas[:period+1]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
     rs = up / (down + 1e-10)
     rsi = np.zeros_like(prices)
-    rsi[:n] = 100. - 100. / (1. + rs)
-    for i in range(n, len(prices)):
+    rsi[:period] = 100. - 100. / (1. + rs)
+    for i in range(period, len(prices)):
         delta = deltas[i - 1]
         if delta > 0: upval, downval = delta, 0.
         else: upval, downval = 0., -delta
-        up = (up * (n - 1) + upval) / n
-        down = (down * (n - 1) + downval) / n
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
         rs = up / (down + 1e-10)
         rsi[i] = 100. - 100. / (1. + rs)
     return rsi
 
-def main_engine(sectors, mode_name, strategy_type="趋势追踪"):
+def main_engine(sectors, strategy_type):
     recommend_list = []
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
@@ -71,43 +78,50 @@ def main_engine(sectors, mode_name, strategy_type="趋势追踪"):
         msg.write(f"正在深度穿透：【{sector}】板块...")
         bar.progress((i + 1) / len(sectors))
         try:
-            # 云端扫描 25 只龙头，保证成功率
-            stocks = ak.stock_board_industry_cons_em(symbol=sector).head(25)
+            # 云端建议扫描深度限制在20只，保证稳定性和速度平衡
+            stocks = ak.stock_board_industry_cons_em(symbol=sector).head(20)
+            
             for _, row in stocks.iterrows():
                 hist = get_safe_hist(row['代码'], start_date, end_date)
+                
                 if hist is not None and len(hist) >= 30:
-                    close = hist['close'].values
+                    prices = hist['close'].values
                     ma20 = hist['close'].rolling(20).mean().values
                     
                     is_match = False
-                    status_text = ""
+                    status_desc = ""
                     
                     if strategy_type == "趋势追踪":
-                        # 逻辑：价格在20日线上方，且均线不向下拐头
-                        if close[-1] > ma20[-1] and ma20[-1] >= ma20[-2] * 0.998:
+                        # 核心逻辑：价格在20日线上方，且20日线近期没有下跌趋势
+                        if prices[-1] > ma20[-1] and ma20[-1] >= ma20[-3]:
                             is_match = True
-                            status_text = "趋势走强"
+                            status_desc = "上升通道"
+                            
                     elif strategy_type == "极低抄底 (超跌反弹)":
-                        rsi_vals = fast_rsi(close)
-                        # 云端环境稍微放宽到 38，增加可见个股
-                        if rsi_vals[-1] < 38:
+                        # 计算指标：RSI 和 乖离率 (Bias)
+                        rsi_vals = calculate_rsi(prices)
+                        bias = (prices[-1] - ma20[-1]) / ma20[-1] * 100
+                        # 云端环境建议放宽到 RSI < 38 或 乖离率 < -7%，以便能看到结果
+                        if rsi_vals[-1] < 38 or bias < -7:
                             is_match = True
-                            status_text = f"超跌反弹 (RSI:{int(rsi_vals[-1])})"
+                            status_desc = f"超跌(RSI:{int(rsi_vals[-1])}/偏离:{int(bias)}%)"
                     
                     if is_match:
                         recommend_list.append({
-                            "代码": row['代码'], "名称": row['名称'], "现价": round(close[-1], 2),
-                            "当日涨幅": row['涨跌幅'], "所属板块": sector, "形态": status_text
+                            "代码": row['代码'], "名称": row['名称'], "现价": round(prices[-1], 2),
+                            "当日涨幅": row['涨跌幅'], "所属板块": sector, "形态": status_desc
                         })
         except:
             continue
+            
     msg.empty()
     bar.empty()
     return pd.DataFrame(recommend_list)
 
-# --- 3. 侧边栏 (完全保留布局) ---
+# --- 3. 侧边栏策略配置 (完全保留您的分类) ---
 with st.sidebar:
     st.markdown('<h2 class="neon-text">🧭 投资地图</h2>', unsafe_allow_html=True)
+    
     strategy_type = st.selectbox("核心选股逻辑", ["趋势追踪", "极低抄底 (超跌反弹)"])
     
     STRATEGY_MAP = {
@@ -125,11 +139,13 @@ with st.sidebar:
 st.markdown(f'<h1 class="neon-text">📈 A股决策中心 · {strategy_type}</h1>', unsafe_allow_html=True)
 
 if st.button("🚀 启动深度扫描", use_container_width=True):
-    with st.spinner("正在获取云端实时行情数据..."):
-        df_res = main_engine(current_sectors, choice, strategy_type)
+    with st.spinner("正在抓取实时云端行情..."):
+        df_res = main_engine(current_sectors, strategy_type)
+        
         if not df_res.empty:
             st.success(f"扫描完毕！发现 {len(df_res)} 只符合特征的个股。")
             df_res = df_res.sort_values("当日涨幅", ascending=False)
+            
             for _, row in df_res.iterrows():
                 st.markdown(f"""
                 <div class="stock-card">
@@ -145,4 +161,7 @@ if st.button("🚀 启动深度扫描", use_container_width=True):
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.warning("⚠️ 当前行业板块暂无符合该逻辑的个股，请尝试切换策略或行业组。")
+            st.warning("⚠️ 云端请求受限或暂无符合条件的个股。如果是抄底模式，说明目前市场整体不处于超跌状态。")
+
+st.divider()
+st.info("💡 **云端提示**：为防止IP被封，云端扫描增加了延迟。如果扫描结果为空，请尝试切换至‘避险红利’或‘大消费’板块再试。")
