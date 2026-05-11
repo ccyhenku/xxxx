@@ -1,5 +1,4 @@
 streamlit
 akshare
-yfinance
-pandas<3.0.0
+pandas
 numpy
